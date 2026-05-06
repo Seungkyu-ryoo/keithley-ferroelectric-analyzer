@@ -3,6 +3,7 @@ import io
 import re
 import sys
 import warnings
+from functools import lru_cache
 from pathlib import Path
 
 import matplotlib.cm as cm
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QAbstractItemView,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -48,10 +50,18 @@ DEFAULT_FOLDER = r"C:\Users\ryoo\Desktop\LDRD\Data\Kiethley\20260504\ALD_HO_716V
 DEFAULT_COLORS = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf"]
 
 
-def read_excel_quiet(path, sheet_name, header=0):
+@lru_cache(maxsize=256)
+def read_excel_quiet_cached(path_text, modified_time, sheet_name, header):
     with warnings.catch_warnings(), contextlib.redirect_stdout(io.StringIO()):
         warnings.simplefilter("ignore")
-        return pd.read_excel(path, sheet_name=sheet_name, header=header)
+        return pd.read_excel(path_text, sheet_name=sheet_name, header=header)
+
+
+def read_excel_quiet(path, sheet_name, header=0):
+    resolved = Path(path).resolve()
+    return read_excel_quiet_cached(
+        str(resolved), resolved.stat().st_mtime, sheet_name, header
+    ).copy()
 
 
 def get_setting(settings_df, name):
@@ -63,6 +73,8 @@ def get_setting(settings_df, name):
 
 def parse_cycle_from_name(path):
     stem = Path(path).stem.lower()
+    if "pristine" in stem:
+        return 1
     cycle_match = re.search(
         r"(\d+(?:\.\d+)?(?:e[+-]?\d+)?)\s*(?:_|-|\s)*cycle\b", stem
     )
@@ -97,6 +109,15 @@ def list_excel_files(folder):
     )
 
 
+def find_excel_files(folder):
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    return sorted(
+        [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in (".xls", ".xlsx")]
+    )
+
+
 def subfolder(base_folder, name):
     base = Path(base_folder)
     if base.name.lower() == name.lower():
@@ -107,6 +128,37 @@ def subfolder(base_folder, name):
     if list_excel_files(base):
         return base
     return base / name
+
+
+def classify_excel_file(path):
+    try:
+        data_df = read_excel_quiet(path, "Data", header=0)
+    except Exception:
+        return None
+    columns = set(map(str, data_df.columns))
+    if {"pundEndurance", "iteration", "Psw", "Qsw"}.issubset(columns):
+        return "Endurance"
+    if {"pundTest", "V", "I", "t"}.issubset(columns):
+        return "PUND"
+    if {"doubleSweepSeg", "Vforce", "Charge"}.issubset(columns):
+        return "PV"
+    return None
+
+
+def files_for_mode(base_folder, mode):
+    base = Path(base_folder)
+    preferred = subfolder(base, mode)
+    candidates = []
+    seen = set()
+    top_level = list_excel_files(base)
+    preferred_files = [] if preferred.resolve() == base.resolve() else list_excel_files(preferred)
+    for path in top_level + preferred_files + find_excel_files(base):
+        key = str(path.resolve()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(path)
+    return [path for path in candidates if classify_excel_file(path) == mode]
 
 
 def charge_to_polarization(charge, area_um2):
@@ -188,10 +240,14 @@ class FerroCycleQtApp(QMainWindow):
         self.x_axis_combo.addItems(["Voltage", "Field"])
         self.pv_y_combo = QComboBox()
         self.pv_y_combo.addItems(["Polarization", "Current density"])
+        self.pv_plot_type_combo = QComboBox()
+        self.pv_plot_type_combo.addItems(["Loop", "Ec vs cycle", "Pr vs cycle"])
+        self.pv_plot_type_combo.currentTextChanged.connect(self.update_pv_metric_options)
         form.addRow("Area (um^2)", self.area_spin)
         form.addRow("Thickness (nm)", self.thick_spin)
         form.addRow("PUND/PV X-axis", self.x_axis_combo)
         form.addRow("PV Y-axis", self.pv_y_combo)
+        form.addRow("PUND/PV plot type", self.pv_plot_type_combo)
         top_layout.addWidget(settings_box, 1, 0)
 
         plot_box = QGroupBox("Plot settings")
@@ -205,6 +261,9 @@ class FerroCycleQtApp(QMainWindow):
         self.legend_size_spin = self.int_spin(11, 6, 60)
         self.line_width_spin = self.double_spin(2.2, 0.1, 20.0, 2)
         self.marker_size_spin = self.double_spin(5.5, 0.0, 30.0, 1)
+        self.endurance_axis_combo = QComboBox()
+        self.endurance_axis_combo.addItems(["Normal", "Broken"])
+        self.break_after_spin = self.int_spin(1, 1, 999)
         self.grid_check = QCheckBox("Grid")
         self.grid_check.setChecked(True)
         self.center_check = QCheckBox("Center dotted axes")
@@ -258,6 +317,10 @@ class FerroCycleQtApp(QMainWindow):
         plot_grid.addWidget(QLabel("Y min/max"), 2, 3)
         plot_grid.addWidget(self.y_min_edit, 2, 4)
         plot_grid.addWidget(self.y_max_edit, 2, 5)
+        plot_grid.addWidget(QLabel("Endurance X"), 2, 6)
+        plot_grid.addWidget(self.endurance_axis_combo, 2, 7)
+        plot_grid.addWidget(QLabel("Break after item"), 2, 8)
+        plot_grid.addWidget(self.break_after_spin, 2, 9)
         top_layout.addWidget(plot_box, 1, 1, 1, 2)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -304,16 +367,41 @@ class FerroCycleQtApp(QMainWindow):
         cycle_layout = QVBoxLayout(cycle_box)
         self.cycle_list = QListWidget()
         self.cycle_list.setSelectionMode(QListWidget.MultiSelection)
+        self.cycle_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.cycle_list.setDefaultDropAction(Qt.MoveAction)
         cycle_layout.addWidget(self.cycle_list)
         cycle_btn_row = QHBoxLayout()
         select_all_btn = QPushButton("Select all")
         select_all_btn.clicked.connect(self.select_all_cycles)
         clear_btn = QPushButton("Clear")
         clear_btn.clicked.connect(self.cycle_list.clearSelection)
+        up_btn = QPushButton("Up")
+        up_btn.clicked.connect(lambda: self.move_selected_items(-1))
+        down_btn = QPushButton("Down")
+        down_btn.clicked.connect(lambda: self.move_selected_items(1))
         cycle_btn_row.addWidget(select_all_btn)
         cycle_btn_row.addWidget(clear_btn)
+        cycle_btn_row.addWidget(up_btn)
+        cycle_btn_row.addWidget(down_btn)
         cycle_layout.addLayout(cycle_btn_row)
         controls_layout.addWidget(cycle_box, 1)
+
+        metric_box = QGroupBox("PUND/PV metric selection")
+        metric_layout = QVBoxLayout(metric_box)
+        self.metric_list = QListWidget()
+        self.metric_list.setSelectionMode(QListWidget.MultiSelection)
+        metric_layout.addWidget(self.metric_list)
+        metric_btn_row = QHBoxLayout()
+        select_metric_btn = QPushButton("Select all")
+        select_metric_btn.clicked.connect(self.select_all_metrics)
+        clear_metric_btn = QPushButton("Clear")
+        clear_metric_btn.clicked.connect(self.metric_list.clearSelection)
+        metric_btn_row.addWidget(select_metric_btn)
+        metric_btn_row.addWidget(clear_metric_btn)
+        metric_layout.addLayout(metric_btn_row)
+        controls_layout.addWidget(metric_box)
+        self.metric_box = metric_box
+        self.update_pv_metric_options()
 
         action_row = QHBoxLayout()
         plot_btn = QPushButton("Plot")
@@ -356,6 +444,26 @@ class FerroCycleQtApp(QMainWindow):
     def set_status(self, text):
         self.status_label.setText(text)
 
+    def update_pv_metric_options(self):
+        if not hasattr(self, "metric_list"):
+            return
+        current = set(self.selected_metrics())
+        self.metric_list.clear()
+        if self.pv_plot_type_combo.currentText() == "Pr vs cycle":
+            options = ["Pr+", "Pr-", "|Pr+|", "|Pr-|", "|Pr+|-|Pr-|", "2Pr"]
+        elif self.pv_plot_type_combo.currentText() == "Ec vs cycle":
+            options = ["Ec+", "Ec-", "|Ec+|", "|Ec-|", "|Ec+|-|Ec-|", "2Ec"]
+        else:
+            options = []
+        for metric in options:
+            item = QListWidgetItem(metric)
+            item.setData(Qt.UserRole, metric)
+            self.metric_list.addItem(item)
+            item.setSelected(metric in current or not current)
+        if options and not self.selected_metrics():
+            self.select_all_metrics()
+        self.metric_box.setEnabled(bool(options))
+
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select base folder", self.folder_edit.text())
         if folder:
@@ -366,13 +474,24 @@ class FerroCycleQtApp(QMainWindow):
         self.cycle_list.clear()
         self.cycle_file_map = {}
         mode = self.mode()
+        files = files_for_mode(self.folder_edit.text(), mode)
         if mode == "Endurance":
-            folder = subfolder(self.folder_edit.text(), "Endurance")
-            files = list_excel_files(folder)
-            self.set_status(f"Endurance: {len(files)} files found")
+            for path in files:
+                try:
+                    settings_df = read_excel_quiet(path, "Settings", header=None)
+                    max_loops = int(get_setting(settings_df, "max_loops"))
+                    label = f"{max_loops:g} loops   ({path.name})"
+                except Exception:
+                    max_loops = None
+                    label = f"? loops   ({path.name})"
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, str(path))
+                item.setData(Qt.UserRole + 1, max_loops)
+                self.cycle_list.addItem(item)
+                item.setSelected(True)
+            self.set_status(f"Endurance: {len(files)} files found. Drag or use Up/Down to set concat order.")
             return
-        folder = subfolder(self.folder_edit.text(), mode)
-        for path in list_excel_files(folder):
+        for path in files:
             cycle = parse_cycle_from_name(path)
             if cycle is None:
                 continue
@@ -381,16 +500,59 @@ class FerroCycleQtApp(QMainWindow):
         for cycle in self.available_cycles:
             item = QListWidgetItem(f"{cycle_label(cycle)}   ({self.cycle_file_map[cycle].name})")
             item.setData(Qt.UserRole, cycle)
-            item.setSelected(True)
             self.cycle_list.addItem(item)
+            item.setSelected(True)
         self.set_status(f"{mode}: {len(self.available_cycles)} cycle files found")
 
     def select_all_cycles(self):
         for idx in range(self.cycle_list.count()):
             self.cycle_list.item(idx).setSelected(True)
 
+    def select_all_metrics(self):
+        for idx in range(self.metric_list.count()):
+            self.metric_list.item(idx).setSelected(True)
+
     def selected_cycles(self):
-        return [item.data(Qt.UserRole) for item in self.cycle_list.selectedItems()]
+        cycles = []
+        for idx in range(self.cycle_list.count()):
+            item = self.cycle_list.item(idx)
+            if item.isSelected():
+                cycles.append(item.data(Qt.UserRole))
+        return cycles
+
+    def selected_metrics(self):
+        metrics = []
+        if not hasattr(self, "metric_list"):
+            return metrics
+        for idx in range(self.metric_list.count()):
+            item = self.metric_list.item(idx)
+            if item.isSelected():
+                metrics.append(item.data(Qt.UserRole))
+        return metrics
+
+    def selected_endurance_paths(self):
+        paths = []
+        for idx in range(self.cycle_list.count()):
+            item = self.cycle_list.item(idx)
+            if item.isSelected():
+                paths.append(Path(item.data(Qt.UserRole)))
+        return paths
+
+    def move_selected_items(self, offset):
+        rows = sorted({idx.row() for idx in self.cycle_list.selectedIndexes()})
+        if not rows:
+            return
+        if offset < 0:
+            iterator = rows
+        else:
+            iterator = reversed(rows)
+        for row in iterator:
+            new_row = row + offset
+            if new_row < 0 or new_row >= self.cycle_list.count():
+                continue
+            item = self.cycle_list.takeItem(row)
+            self.cycle_list.insertItem(new_row, item)
+            item.setSelected(True)
 
     def new_figure(self):
         if self.canvas is not None:
@@ -406,6 +568,8 @@ class FerroCycleQtApp(QMainWindow):
             facecolor="white",
         )
         self.ax = self.fig.add_subplot(111)
+        self.axes = [self.ax]
+        self.figure_title = None
         self.canvas = FigureCanvasQTAgg(self.fig)
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
         if self.lock_size_check.isChecked():
@@ -488,98 +652,158 @@ class FerroCycleQtApp(QMainWindow):
         x_max = self.optional_float(self.x_max_edit)
         y_min = self.optional_float(self.y_min_edit)
         y_max = self.optional_float(self.y_max_edit)
-        if x_min is not None or x_max is not None:
-            left, right = self.ax.get_xlim()
-            left = x_min if x_min is not None else left
-            right = x_max if x_max is not None else right
-            if self.ax.get_xscale() == "log":
-                if left <= 0:
-                    left = self.ax.get_xlim()[0]
-                if right <= 0:
-                    right = self.ax.get_xlim()[1]
-            if left < right:
-                self.ax.set_xlim(left, right)
-        if y_min is not None or y_max is not None:
-            bottom, top = self.ax.get_ylim()
-            bottom = y_min if y_min is not None else bottom
-            top = y_max if y_max is not None else top
-            if bottom < top:
-                self.ax.set_ylim(bottom, top)
+        for ax in getattr(self, "axes", [self.ax]):
+            if x_min is not None or x_max is not None:
+                left, right = ax.get_xlim()
+                left = x_min if x_min is not None else left
+                right = x_max if x_max is not None else right
+                if ax.get_xscale() == "log":
+                    if left <= 0:
+                        left = ax.get_xlim()[0]
+                    if right <= 0:
+                        right = ax.get_xlim()[1]
+                if left < right:
+                    ax.set_xlim(left, right)
+            if y_min is not None or y_max is not None:
+                bottom, top = ax.get_ylim()
+                bottom = y_min if y_min is not None else bottom
+                top = y_max if y_max is not None else top
+                if bottom < top:
+                    ax.set_ylim(bottom, top)
 
     def finish_plot(self):
         self.apply_manual_limits()
         if not self.show_title_check.isChecked():
-            self.ax.set_title("")
+            if self.figure_title is not None:
+                self.figure_title.set_text("")
+            for ax in getattr(self, "axes", [self.ax]):
+                ax.set_title("")
         if not self.show_x_label_check.isChecked():
-            self.ax.set_xlabel("")
+            for ax in getattr(self, "axes", [self.ax]):
+                ax.set_xlabel("")
         if not self.show_y_label_check.isChecked():
-            self.ax.set_ylabel("")
-        if self.grid_check.isChecked():
-            self.ax.grid(True, which="major", linestyle="-", linewidth=0.7, alpha=0.28)
-            self.ax.grid(True, which="minor", linestyle=":", linewidth=0.5, alpha=0.18)
+            for ax in getattr(self, "axes", [self.ax]):
+                ax.set_ylabel("")
+        if self.figure_title is not None:
+            self.figure_title.set_fontsize(self.title_size_spin.value())
+            self.figure_title.set_fontweight("semibold")
+        for ax in getattr(self, "axes", [self.ax]):
+            if self.grid_check.isChecked():
+                ax.grid(True, which="major", linestyle="-", linewidth=0.7, alpha=0.28)
+                ax.grid(True, which="minor", linestyle=":", linewidth=0.5, alpha=0.18)
+            else:
+                ax.grid(False)
+            ax.minorticks_on()
+            ax.tick_params(direction="in", top=True, right=True, labelsize=self.tick_size_spin.value())
+            ax.tick_params(which="minor", direction="in", top=True, right=True)
+            ax.title.set_fontsize(self.title_size_spin.value())
+            ax.title.set_fontweight("semibold")
+            ax.xaxis.label.set_fontsize(self.axis_size_spin.value())
+            ax.yaxis.label.set_fontsize(self.axis_size_spin.value())
+            for side in ("top", "right", "left", "bottom"):
+                ax.spines[side].set_visible(True)
+                ax.spines[side].set_linewidth(1.0)
+            if self.center_check.isChecked():
+                ax.axhline(0, color="0.15", linewidth=0.9, linestyle=":", zorder=0.4)
+                if ax.get_xscale() != "log":
+                    ax.axvline(0, color="0.15", linewidth=0.9, linestyle=":", zorder=0.4)
+            legend = ax.get_legend()
+            if legend is not None:
+                for text in legend.get_texts():
+                    text.set_fontsize(self.legend_size_spin.value())
+        if len(getattr(self, "axes", [self.ax])) > 1:
+            self.fig.subplots_adjust(left=0.12, right=0.97, bottom=0.15, top=0.86, wspace=0.06)
         else:
-            self.ax.grid(False)
-        self.ax.minorticks_on()
-        self.ax.tick_params(direction="in", top=True, right=True, labelsize=self.tick_size_spin.value())
-        self.ax.tick_params(which="minor", direction="in", top=True, right=True)
-        self.ax.title.set_fontsize(self.title_size_spin.value())
-        self.ax.title.set_fontweight("semibold")
-        self.ax.xaxis.label.set_fontsize(self.axis_size_spin.value())
-        self.ax.yaxis.label.set_fontsize(self.axis_size_spin.value())
-        for side in ("top", "right", "left", "bottom"):
-            self.ax.spines[side].set_visible(True)
-            self.ax.spines[side].set_linewidth(1.0)
-        if self.center_check.isChecked():
-            self.ax.axhline(0, color="0.15", linewidth=0.9, linestyle=":", zorder=0.4)
-            if self.ax.get_xscale() != "log":
-                self.ax.axvline(0, color="0.15", linewidth=0.9, linestyle=":", zorder=0.4)
-        legend = self.ax.get_legend()
-        if legend is not None:
-            for text in legend.get_texts():
-                text.set_fontsize(self.legend_size_spin.value())
-        self.fig.tight_layout()
+            self.fig.tight_layout(rect=(0, 0, 1, 0.94) if self.figure_title is not None else None)
         self.canvas.draw_idle()
 
+    def draw_break_marks(self, left_ax, right_ax):
+        size = 0.018
+        kwargs = dict(transform=left_ax.transAxes, color="0.05", clip_on=False, linewidth=1.4)
+        left_ax.plot((1 - size, 1 + size), (-size, size), **kwargs)
+        left_ax.plot((1 - size, 1 + size), (1 - size, 1 + size), **kwargs)
+        kwargs.update(transform=right_ax.transAxes)
+        right_ax.plot((-size, size), (size, -size), **kwargs)
+        right_ax.plot((-size, size), (1 + size, 1 - size), **kwargs)
+
     def plot_endurance(self):
-        folder = subfolder(self.folder_edit.text(), "Endurance")
         infos = []
-        for path in list_excel_files(folder):
+        paths = self.selected_endurance_paths()
+        if not paths:
+            paths = files_for_mode(self.folder_edit.text(), "Endurance")
+        for order, path in enumerate(paths):
             try:
                 data_df = read_excel_quiet(path, "Data")
                 settings_df = read_excel_quiet(path, "Settings", header=None)
-                infos.append((int(get_setting(settings_df, "max_loops")), path, data_df))
+                infos.append((order, int(get_setting(settings_df, "max_loops")), path, data_df))
             except Exception:
                 continue
         if not infos:
             raise ValueError("No readable Endurance files found.")
-        infos.sort(key=lambda item: item[0])
         blocks = []
         previous_end = 0
-        for max_loops, path, data_df in infos:
+        break_idx = min(max(self.break_after_spin.value(), 1), max(len(infos) - 1, 1))
+        broken_axis = self.endurance_axis_combo.currentText() == "Broken" and len(infos) > 1
+        segment_end = 0
+        for idx, (_, max_loops, path, data_df) in enumerate(infos):
+            if broken_axis and idx == break_idx:
+                segment_end = 0
             block = data_df.copy()
             block.insert(0, "file", path.name)
             block.insert(1, "global_cycle", previous_end + block["iteration"])
             block["plot_cycle"] = block["global_cycle"].clip(lower=1)
+            block["axis_segment"] = 1 if broken_axis and idx >= break_idx else 0
+            block["axis_cycle"] = (segment_end + block["iteration"]).clip(lower=1)
             block["Psw_uC_cm2"] = charge_to_polarization(block["Psw"], self.area_spin.value())
             block["Qsw_uC_cm2"] = charge_to_polarization(block["Qsw"], self.area_spin.value())
             blocks.append(block)
             previous_end += max_loops
+            segment_end += max_loops
         df = pd.concat(blocks, ignore_index=True)
         self.current_df = df
         colors = self.color_cycle(2)
-        self.ax.plot(
-            df["plot_cycle"], df["Psw_uC_cm2"], "o-", color=colors[0][0], alpha=colors[0][1],
-            linewidth=self.line_width_spin.value(), markersize=self.marker_size_spin.value(), label="Psw"
-        )
-        self.ax.plot(
-            df["plot_cycle"], df["Qsw_uC_cm2"], "s-", color=colors[1][0], alpha=colors[1][1],
-            linewidth=self.line_width_spin.value(), markersize=self.marker_size_spin.value(), label="Qsw"
-        )
-        self.ax.set_xscale("log")
-        self.ax.set_xlabel("Cycle")
-        self.ax.set_ylabel(r"Switched polarization ($\mu\mathrm{C}/\mathrm{cm}^{2}$)")
-        self.ax.set_title("Combined Endurance")
-        self.ax.legend()
+        if broken_axis:
+            self.fig.clear()
+            left_ax, right_ax = self.fig.subplots(
+                1, 2, sharey=True, gridspec_kw={"width_ratios": [1, 1], "wspace": 0.06}
+            )
+            self.ax = left_ax
+            self.axes = [left_ax, right_ax]
+            self.figure_title = self.fig.suptitle("Combined Endurance")
+            for axis_idx, ax in enumerate(self.axes):
+                part = df[df["axis_segment"] == axis_idx]
+                if part.empty:
+                    continue
+                ax.plot(
+                    part["axis_cycle"], part["Psw_uC_cm2"], "o-", color=colors[0][0], alpha=colors[0][1],
+                    linewidth=self.line_width_spin.value(), markersize=self.marker_size_spin.value(),
+                    label="Psw" if axis_idx == 0 else None
+                )
+                ax.plot(
+                    part["axis_cycle"], part["Qsw_uC_cm2"], "s-", color=colors[1][0], alpha=colors[1][1],
+                    linewidth=self.line_width_spin.value(), markersize=self.marker_size_spin.value(),
+                    label="Qsw" if axis_idx == 0 else None
+                )
+                ax.set_xscale("log")
+                ax.set_xlabel("Cycle" if axis_idx == 0 else "Cycle after break")
+            left_ax.set_ylabel(r"Switched polarization ($\mu\mathrm{C}/\mathrm{cm}^{2}$)")
+            right_ax.tick_params(labelleft=False)
+            left_ax.legend()
+            self.draw_break_marks(left_ax, right_ax)
+        else:
+            self.ax.plot(
+                df["plot_cycle"], df["Psw_uC_cm2"], "o-", color=colors[0][0], alpha=colors[0][1],
+                linewidth=self.line_width_spin.value(), markersize=self.marker_size_spin.value(), label="Psw"
+            )
+            self.ax.plot(
+                df["plot_cycle"], df["Qsw_uC_cm2"], "s-", color=colors[1][0], alpha=colors[1][1],
+                linewidth=self.line_width_spin.value(), markersize=self.marker_size_spin.value(), label="Qsw"
+            )
+            self.ax.set_xscale("log")
+            self.ax.set_xlabel("Cycle")
+            self.ax.set_ylabel(r"Switched polarization ($\mu\mathrm{C}/\mathrm{cm}^{2}$)")
+            self.ax.set_title("Combined Endurance")
+            self.ax.legend()
         self.set_status(f"Endurance plotted: {len(df)} rows, final cycle {df['global_cycle'].max():g}")
 
     def calculate_pund_file(self, path):
@@ -616,10 +840,93 @@ class FerroCycleQtApp(QMainWindow):
         p_neg -= (p_neg[0] + p_neg[-1]) / 2.0
         return pd.DataFrame({"Voltage_Pos_V": v_p, "P_Pos_uC_cm2": p_pos, "Voltage_Neg_V": v_n, "P_Neg_uC_cm2": p_neg})
 
+    def metric_row_from_loop(self, cycle, file_name, pos_voltage, pos_pol, neg_voltage, neg_pol):
+        pos_x = pos_voltage if self.x_axis_combo.currentText() == "Voltage" else voltage_to_field(pos_voltage, self.thick_spin.value())
+        neg_x = neg_voltage if self.x_axis_combo.currentText() == "Voltage" else voltage_to_field(neg_voltage, self.thick_spin.value())
+        ec_pos_candidates = [value for value in self.crossing_values(pos_x, pos_pol, 0.0) if value > 0]
+        ec_neg_candidates = [value for value in self.crossing_values(neg_x, neg_pol, 0.0) if value < 0]
+        ec_pos = min(ec_pos_candidates, key=abs) if ec_pos_candidates else np.nan
+        ec_neg = min(ec_neg_candidates, key=abs) if ec_neg_candidates else np.nan
+        pos_v = np.asarray(pos_voltage, dtype=float)
+        pos_p = np.asarray(pos_pol, dtype=float)
+        neg_v = np.asarray(neg_voltage, dtype=float)
+        neg_p = np.asarray(neg_pol, dtype=float)
+        pos_start = int(np.nanargmax(pos_v)) if len(pos_v) else 0
+        neg_start = int(np.nanargmin(neg_v)) if len(neg_v) else 0
+        pr_pos = pos_p[pos_start + int(np.nanargmin(np.abs(pos_v[pos_start:])))] if len(pos_v[pos_start:]) else np.nan
+        pr_neg = neg_p[neg_start + int(np.nanargmin(np.abs(neg_v[neg_start:])))] if len(neg_v[neg_start:]) else np.nan
+        return {
+            "cycle": cycle,
+            "file": file_name,
+            "Ec+": ec_pos,
+            "Ec-": ec_neg,
+            "|Ec+|": abs(ec_pos) if np.isfinite(ec_pos) else np.nan,
+            "|Ec-|": abs(ec_neg) if np.isfinite(ec_neg) else np.nan,
+            "|Ec+|-|Ec-|": abs(ec_pos) - abs(ec_neg) if np.isfinite([ec_pos, ec_neg]).all() else np.nan,
+            "2Ec": abs(ec_pos) + abs(ec_neg) if np.isfinite([ec_pos, ec_neg]).all() else np.nan,
+            "Pr+": pr_pos,
+            "Pr-": pr_neg,
+            "|Pr+|": abs(pr_pos) if np.isfinite(pr_pos) else np.nan,
+            "|Pr-|": abs(pr_neg) if np.isfinite(pr_neg) else np.nan,
+            "|Pr+|-|Pr-|": abs(pr_pos) - abs(pr_neg) if np.isfinite([pr_pos, pr_neg]).all() else np.nan,
+            "2Pr": pr_pos - pr_neg if np.isfinite([pr_pos, pr_neg]).all() else np.nan,
+        }
+
+    def plot_metric_summary(self, summary, source_name):
+        if self.pv_plot_type_combo.currentText() == "Ec vs cycle":
+            all_metrics = ["Ec+", "Ec-", "|Ec+|", "|Ec-|", "|Ec+|-|Ec-|", "2Ec"]
+            ylabel = "Coercive voltage (V)" if self.x_axis_combo.currentText() == "Voltage" else "Coercive field (MV/cm)"
+            title = f"{source_name} Ec vs Cycle"
+        else:
+            all_metrics = ["Pr+", "Pr-", "|Pr+|", "|Pr-|", "|Pr+|-|Pr-|", "2Pr"]
+            ylabel = r"Remanent polarization ($\mu\mathrm{C}/\mathrm{cm}^{2}$)"
+            title = f"{source_name} Pr vs Cycle"
+        metrics = [metric for metric in self.selected_metrics() if metric in all_metrics]
+        if not metrics:
+            raise ValueError(f"Select at least one {source_name} metric.")
+        colors = self.color_cycle(len(metrics))
+        for idx, metric in enumerate(metrics):
+            color, alpha = colors[idx]
+            self.ax.plot(
+                summary["cycle"], summary[metric], "o-",
+                color=color, alpha=alpha,
+                linewidth=self.line_width_spin.value(),
+                markersize=self.marker_size_spin.value(),
+                label=metric,
+            )
+        self.ax.set_xscale("log")
+        self.ax.set_xlabel("Cycle")
+        self.ax.set_ylabel(ylabel)
+        self.ax.set_title(title)
+        self.ax.legend()
+        self.set_status(f"{title}: {len(summary)} cycles, {len(metrics)} metrics")
+
+    def plot_pund_metrics(self, cycles):
+        rows = []
+        for cycle in cycles:
+            path = self.cycle_file_map[cycle]
+            try:
+                df = self.calculate_pund_file(path)
+                rows.append(self.metric_row_from_loop(
+                    cycle, path.name,
+                    df["Voltage_Pos_V"], df["P_Pos_uC_cm2"],
+                    df["Voltage_Neg_V"], df["P_Neg_uC_cm2"],
+                ))
+            except Exception:
+                continue
+        if not rows:
+            raise ValueError("No readable PUND metric files found.")
+        summary = pd.DataFrame(rows).sort_values("cycle")
+        self.current_df = summary
+        self.plot_metric_summary(summary, "PUND")
+
     def plot_pund(self):
         cycles = self.selected_cycles()
         if not cycles:
             raise ValueError("Select at least one PUND cycle.")
+        if self.pv_plot_type_combo.currentText() != "Loop":
+            self.plot_pund_metrics(cycles)
+            return
         colors = self.color_cycle(len(cycles))
         frames = []
         for idx, cycle in enumerate(cycles):
@@ -654,10 +961,96 @@ class FerroCycleQtApp(QMainWindow):
                 break
         return polarization.median() if plus_pr is None else (minus_pr + plus_pr) / 2.0
 
+    def crossing_values(self, x_data, y_data, target):
+        x = np.asarray(x_data, dtype=float)
+        y = np.asarray(y_data, dtype=float)
+        values = []
+        for idx in range(len(x) - 1):
+            x0, x1 = x[idx], x[idx + 1]
+            y0, y1 = y[idx], y[idx + 1]
+            if not np.isfinite([x0, x1, y0, y1]).all():
+                continue
+            d0 = y0 - target
+            d1 = y1 - target
+            if d0 == 0:
+                values.append(x0)
+            elif d0 * d1 < 0 and y1 != y0:
+                values.append(x0 + (target - y0) * (x1 - x0) / (y1 - y0))
+        return values
+
+    def interpolate_at_x(self, x_data, y_data, target):
+        x = np.asarray(x_data, dtype=float)
+        y = np.asarray(y_data, dtype=float)
+        values = []
+        for idx in range(len(x) - 1):
+            x0, x1 = x[idx], x[idx + 1]
+            y0, y1 = y[idx], y[idx + 1]
+            if not np.isfinite([x0, x1, y0, y1]).all():
+                continue
+            d0 = x0 - target
+            d1 = x1 - target
+            if d0 == 0:
+                values.append(y0)
+            elif d0 * d1 < 0 and x1 != x0:
+                values.append(y0 + (target - x0) * (y1 - y0) / (x1 - x0))
+        return values
+
+    def calculate_pv_metric_file(self, path, cycle):
+        df = read_excel_quiet(path, "Data")
+        if not {"Vforce", "Charge"}.issubset(df.columns):
+            raise ValueError(f"Missing PV columns: {path.name}")
+        voltage = df["Vforce"]
+        polarization = charge_to_polarization(df["Charge"], self.area_spin.value())
+        polarization -= self.pv_offset(voltage, polarization)
+        ec_axis = voltage if self.x_axis_combo.currentText() == "Voltage" else voltage_to_field(voltage, self.thick_spin.value())
+        ec_crossings = self.crossing_values(ec_axis, polarization, 0.0)
+        ec_pos_values = [value for value in ec_crossings if value > 0]
+        ec_neg_values = [value for value in ec_crossings if value < 0]
+        ec_pos = min(ec_pos_values, key=abs) if ec_pos_values else np.nan
+        ec_neg = min(ec_neg_values, key=abs) if ec_neg_values else np.nan
+        pr_crossings = self.interpolate_at_x(voltage, polarization, 0.0)
+        pr_pos_values = [value for value in pr_crossings if value > 0]
+        pr_neg_values = [value for value in pr_crossings if value < 0]
+        pr_pos = max(pr_pos_values) if pr_pos_values else np.nan
+        pr_neg = min(pr_neg_values) if pr_neg_values else np.nan
+        return {
+            "cycle": cycle,
+            "file": path.name,
+            "Ec+": ec_pos,
+            "Ec-": ec_neg,
+            "|Ec+|": abs(ec_pos) if np.isfinite(ec_pos) else np.nan,
+            "|Ec-|": abs(ec_neg) if np.isfinite(ec_neg) else np.nan,
+            "|Ec+|-|Ec-|": abs(ec_pos) - abs(ec_neg) if np.isfinite([ec_pos, ec_neg]).all() else np.nan,
+            "2Ec": abs(ec_pos) + abs(ec_neg) if np.isfinite([ec_pos, ec_neg]).all() else np.nan,
+            "Pr+": pr_pos,
+            "Pr-": pr_neg,
+            "|Pr+|": abs(pr_pos) if np.isfinite(pr_pos) else np.nan,
+            "|Pr-|": abs(pr_neg) if np.isfinite(pr_neg) else np.nan,
+            "|Pr+|-|Pr-|": abs(pr_pos) - abs(pr_neg) if np.isfinite([pr_pos, pr_neg]).all() else np.nan,
+            "2Pr": pr_pos - pr_neg if np.isfinite([pr_pos, pr_neg]).all() else np.nan,
+        }
+
+    def plot_pv_metrics(self, cycles):
+        rows = []
+        for cycle in cycles:
+            path = self.cycle_file_map[cycle]
+            try:
+                rows.append(self.calculate_pv_metric_file(path, cycle))
+            except Exception:
+                continue
+        if not rows:
+            raise ValueError("No readable PV metric files found.")
+        summary = pd.DataFrame(rows).sort_values("cycle")
+        self.current_df = summary
+        self.plot_metric_summary(summary, "PV")
+
     def plot_pv(self):
         cycles = self.selected_cycles()
         if not cycles:
             raise ValueError("Select at least one PV cycle.")
+        if self.pv_plot_type_combo.currentText() != "Loop":
+            self.plot_pv_metrics(cycles)
+            return
         colors = self.color_cycle(len(cycles))
         frames = []
         for idx, cycle in enumerate(cycles):

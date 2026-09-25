@@ -48,3 +48,9 @@ py ferro_cycle_analyzer.py
 - Endurance files show their `max_loops` value from the `Settings` sheet and are concatenated in the order shown in the file list.
 - The app expects Keithley Excel files with sheets such as `Data` and `Settings`.
 - Raw measurement data files are intentionally not included in this repository.
+
+## Contributors
+
+- [@Seungkyu-ryoo](https://github.com/Seungkyu-ryoo) — Project author and maintainer.
+- **Claude (Anthropic)** — AI-assisted development.
+- **Codex (OpenAI)** — AI-assisted development.
